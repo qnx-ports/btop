@@ -830,11 +830,11 @@ static auto configure_tty_mode(std::optional<bool> force_tty) {
 		Logger::debug("TTY mode set via command line");
   	}
 
-#if !defined(__APPLE__) && !defined(__OpenBSD__) && !defined(__NetBSD__)
+#if !defined(__APPLE__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(__QNX__)
 	else if (Term::current_tty.starts_with("/dev/tty")) {
 		Config::set("tty_mode", true);
 		Logger::debug("Auto detect real TTY");
-  	}
+	}
 #endif
 
 	Logger::debug(fmt::format("TTY mode enabled: {}", Config::getB("tty_mode")));
