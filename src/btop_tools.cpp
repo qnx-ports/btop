@@ -38,6 +38,9 @@ tab-size = 4
 #include "btop_shared.hpp"
 #include "btop_tools.hpp"
 #include "btop_config.hpp"
+#ifdef __QNX__
+#include <unix.h> // setlinebuf
+#endif
 
 using std::cout;
 using std::floor;
@@ -84,7 +87,7 @@ namespace Term {
 				settings.c_cc[VTIME] = 0;
 			}
 			if (tcsetattr(STDIN_FILENO, TCSANOW, &settings)) return false;
-			if (on) setvbuf(stdin, nullptr, _IOLBF, 0);
+			if (on) setlinebuf(stdin);
 			else setbuf(stdin, nullptr);
 			return true;
 		}

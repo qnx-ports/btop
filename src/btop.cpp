@@ -214,10 +214,10 @@ void clean_quit(int sig) {
 	#else
 		constexpr struct timespec ts { .tv_sec = 5, .tv_nsec = 0 };
 		#ifdef __QNX__
-				if (pthread_timedjoin(Runner::runner_id, nullptr, &ts) != 0) {
-#else
-				if (pthread_timedjoin_np(Runner::runner_id, nullptr, &ts) != 0) {
-#endif
+		if (pthread_timedjoin(Runner::runner_id, nullptr, &ts) != 0) {
+		#else
+		if (pthread_timedjoin_np(Runner::runner_id, nullptr, &ts) != 0) {
+		#endif
 			Logger::warning("Failed to join _runner thread on exit!");
 			pthread_cancel(Runner::runner_id);
 		}
