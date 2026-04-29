@@ -59,10 +59,7 @@ tab-size = 4
 #include <utility>
 #include <vector>
 
-#include <fmt/format.h>
-
 #include "../btop_config.hpp"
-#include "../btop_log.hpp"
 #include "../btop_shared.hpp"
 #include "../btop_tools.hpp"
 
@@ -512,8 +509,7 @@ namespace Net {
             IfAddrsPtr if_addrs{};
             if (if_addrs.get_status() != 0) {
                 errors++;
-                Logger::error("Net::collect() -> getifaddrs() failed with id {}",
-                              if_addrs.get_status());
+                Logger::error("Net::collect() -> getifaddrs() failed with id {}" + to_string(if_addrs.get_status()));
                 redraw = true;
                 return empty_net;
             }
