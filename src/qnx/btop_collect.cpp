@@ -1,5 +1,4 @@
 /* Copyright 2021 Aristocratos (jakob@qvantnet.com)
-   QNX Neutrino platform backend for btop++
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -63,7 +62,7 @@ tab-size = 4
 #include "../btop_shared.hpp"
 #include "../btop_tools.hpp"
 
-using std::clamp, std::string_literals::operator""s, std::cmp_equal, std::cmp_less, std::cmp_greater;
+using std::clamp, std::string_literals::operator""s, std::cmp_less, std::cmp_greater;
 using std::ifstream, std::numeric_limits, std::streamsize, std::round, std::max, std::min;
 namespace fs = std::filesystem;
 namespace rng = std::ranges;
@@ -75,7 +74,7 @@ using namespace Tools;
 
 namespace {
 
-constexpr unsigned int QNX_MAX_CPUS = 256;
+constexpr unsigned int QNX_MAX_CPUS = 64;
 
 // Idle nanoseconds per CPU, sampled at each Cpu::collect() call.
 uint64_t prev_idle_ns[QNX_MAX_CPUS] = {};
@@ -85,12 +84,6 @@ uint64_t cpu_collect_ms = 0;
 
 // time_ms() reading when the previous Proc::collect cycle completed (set by Proc::collect).
 uint64_t proc_collect_ms = 0;
-
-// Unix epoch of system boot (filled in Shared::init).
-time_t boot_time_sec = 0;
-
-// Total physical RAM in bytes (from syspage asinfo).
-uint64_t total_ram_bytes = 0;
 
 // Load average state (exponential moving average over 1/5/15 min).
 double load_avg_vals[3] = {0.0, 0.0, 0.0};
@@ -119,29 +112,6 @@ std::string read_proc_file(const std::string& path) {
     return buf;
 }
 
-// Sum all "ram" asinfo entries → total physical bytes.
-uint64_t read_total_ram() {
-    uint64_t total = 0;
-    const struct asinfo_entry* as = SYSPAGE_ENTRY(asinfo);
-    int n = (int)(SYSPAGE_ENTRY_SIZE(asinfo) / sizeof(*as));
-    const char* strings = SYSPAGE_ENTRY(strings)->data;
-    for (int i = 0; i < n; i++) {
-        if (std::strcmp(strings + as[i].name, "ram") == 0)
-            total += as[i].end - as[i].start + 1;
-    }
-    return total;
-}
-
-// Free physical RAM via POSIX typed-memory interface.
-uint64_t read_free_ram() {
-    int fd = posix_typed_mem_open("ram", O_RDONLY, POSIX_TYPED_MEM_ALLOCATE);
-    if (fd < 0) return 0;
-    struct posix_typed_mem_info info{};
-    posix_typed_mem_get_info(fd, &info);
-    close(fd);
-    return (uint64_t)info.posix_tmi_length;
-}
-
 // Update exponential moving-average load estimates.
 // runnable = number of threads in RUNNING or READY state across all processes.
 void update_load_avg(double runnable) {
@@ -163,11 +133,6 @@ void update_load_avg(double runnable) {
 }
 
 } // anonymous namespace
-
-// ---------------------------------------------------------------------------
-// Forward declarations of per-namespace storage
-// (These must precede Shared::init which references them.)
-// ---------------------------------------------------------------------------
 
 namespace Cpu {
     vector<long long> core_old_totals;
@@ -191,76 +156,72 @@ namespace Cpu {
 } // namespace Cpu
 
 namespace Mem {
-    bool            has_swap  = false;
-    int             disk_ios  = 0;
-    vector<string>  last_found;
-    mem_info        current_mem{};
-
-    auto collect(bool no_update) -> mem_info&;
-} // namespace Mem
+	double old_uptime;
+} 
 
 // ---------------------------------------------------------------------------
 // Shared::init
 // ---------------------------------------------------------------------------
 
 namespace Shared {
-    long coreCount, page_size, clk_tck;
+	fs::path procPath, passwd_path;
+	long coreCount, pageSize, clk_tck;
 
-    void init() {
-        // CPU count
-        coreCount = (long)_syspage_ptr->num_cpu;
-        if (coreCount < 1) coreCount = 1;
+	void init() {
+		//? Shared global variables init
+		procPath = (fs::is_directory(fs::path("/proc")) and access("/proc", R_OK) != -1) ? "/proc" : "";
+		if (procPath.empty())
+			throw std::runtime_error( "Proc filesystem not found or no permission to read from it!");
+		passwd_path = (fs::is_regular_file(fs::path("/etc/passwd")) and access("/etc/passwd", R_OK) != -1) ? "/etc/passwd" : "";
+		if (passwd_path.empty())
+			Logger::warning( "Could not read /etc/passwd, will show UID instead of username.");
 
-        // Page size
-        page_size = sysconf(_SC_PAGE_SIZE);
-        if (page_size <= 0) page_size = 4096;
+		// CPU count No difference between physical and core count on QNX
+		coreCount = (long)_syspage_ptr->num_cpu;
+		if (coreCount < 1) {
+			coreCount = 1;
+			Logger::warning( "Could not determine number of cores, defaulting to 1."); 
+		}
 
-        // Clock ticks
-        clk_tck = sysconf(_SC_CLK_TCK);
-        if (clk_tck <= 0) clk_tck = 100;
+		// Page size
+		pageSize = sysconf(_SC_PAGE_SIZE);
+		if (pageSize <= 0) {
+			pageSize = 4096;
+			Logger::warning("Could not get system page size. Defaulting to 4096, processes memory usage might be incorrect.");
+		}
 
-        // Total RAM
-        total_ram_bytes = read_total_ram();
+		// Clock ticks
+		clk_tck = sysconf(_SC_CLK_TCK);
+		if (clk_tck <= 0) {
+			clk_tck = 100;
+			Logger::warning( "Could not get system clock ticks per second. Defaulting to 100, processes cpu usage might be incorrect.");
+		}
 
-        // Boot time
-        boot_time_sec = (time_t)SYSPAGE_ENTRY(qtime)->boot_time;
+		// Init per-core percent storage
+		Cpu::current_cpu.core_percent.insert(Cpu::current_cpu.core_percent.begin(), Shared::coreCount, {});
+		Cpu::current_cpu.temp.insert(Cpu::current_cpu.temp.begin(), Shared::coreCount + 1, {});
+		Cpu::core_old_totals.insert(Cpu::core_old_totals.begin(), Shared::coreCount, 0);
+		Cpu::core_old_idles.insert(Cpu::core_old_idles.begin(), Shared::coreCount, 0);
+		for (auto &[field, vec] : Cpu::current_cpu.cpu_percent) {
+			if (not vec.empty() and not v_contains(Cpu::available_fields, field))
+				Cpu::available_fields.push_back(field);
+		}
 
-        // Init per-core percent storage
-        Cpu::current_cpu.core_percent.assign((size_t)coreCount, {});
-        Cpu::current_cpu.temp.assign((size_t)coreCount + 1, {});
-        Cpu::core_old_totals.assign((size_t)coreCount, 0LL);
-        Cpu::core_old_idles.assign((size_t)coreCount, 0LL);
+		Cpu::collect();
+		Cpu::cpuName = Cpu::get_cpuName();
+		Cpu::core_mapping = Cpu::get_core_mapping();
 
-        Logger::debug("Shared::init -> Cpu::collect()");
-        Cpu::collect();
+		Mem::old_uptime = system_uptime();
+		Mem::collect();
 
-        for (auto& [field, vec] : Cpu::current_cpu.cpu_percent) {
-            if (not vec.empty() and not v_contains(Cpu::available_fields, field))
-                Cpu::available_fields.push_back(field);
-        }
-
-        Logger::debug("Shared::init -> Cpu::get_cpuName()");
-        Cpu::cpuName = Cpu::get_cpuName();
-
-        Logger::debug("Shared::init -> Cpu::get_core_mapping()");
-        Cpu::core_mapping = Cpu::get_core_mapping();
-
-        Logger::debug("Shared::init -> Mem::collect()");
-        Mem::collect();
-
-        Logger::debug("Shared::init complete");
-    }
+		Logger::debug("Shared::init() : Initialized.");
+	}
 } // namespace Shared
 
-// ---------------------------------------------------------------------------
-// Tools::system_uptime
-// ---------------------------------------------------------------------------
 
 namespace Tools {
     double system_uptime() {
-        time_t bt = boot_time_sec;
-        if (bt == 0)
-            bt = (time_t)SYSPAGE_ENTRY(qtime)->boot_time;
+        time_t bt = (time_t)SYSPAGE_ENTRY(qtime)->boot_time;
         return (double)(time(nullptr) - bt);
     }
 } // namespace Tools
@@ -272,10 +233,8 @@ namespace Tools {
 namespace Cpu {
 
     string get_cpuName() {
-        struct utsname un{};
-        if (uname(&un) == 0)
-            return std::string(un.machine) + " (" + un.sysname + " " + un.release + ")";
-        return "QNX CPU";
+		struct cpuinfo_entry *cpuinfo = _SYSPAGE_ENTRY(_syspage_ptr, cpuinfo);
+		return SYSPAGE_ENTRY(strings)->data + cpuinfo->name;
     }
 
     string get_cpuHz() { return {}; }
@@ -361,131 +320,162 @@ namespace Cpu {
     }
 } // namespace Cpu
 
-// ---------------------------------------------------------------------------
-// Mem namespace — full implementation
-// ---------------------------------------------------------------------------
-
 namespace Mem {
+	bool has_swap{};
+	mem_info current_mem {};
+	uint64_t totalRam = 0;
+	int disk_ios{};
+	vector<string> last_found;
 
-    uint64_t get_totalMem() { return total_ram_bytes; }
+    uint64_t get_totalMem() {
+		if (totalRam == 0) Mem::collect();
 
-    auto collect(bool no_update) -> mem_info& {
-        if (Runner::stopping or (no_update and not current_mem.percent.at("used").empty()))
-            return current_mem;
+		return totalRam;
+	}
 
-        auto& mem = current_mem;
+	auto collect(bool no_update) -> mem_info & {
+		if (Runner::stopping or (no_update and not current_mem.percent.at("used").empty()))
+			return current_mem;
 
-        uint64_t total      = total_ram_bytes;
-        uint64_t free_bytes = read_free_ram();
-        uint64_t used_bytes = (free_bytes < total) ? (total - free_bytes) : 0;
+		auto show_disks = Config::getB("show_disks");
+		auto &mem = current_mem;
 
-        mem.stats.at("used")      = used_bytes;
-        mem.stats.at("free")      = free_bytes;
-        mem.stats.at("available") = free_bytes;
-        mem.stats.at("cached")    = 0;
-        mem.stats.at("swap_total") = 0;
-        mem.stats.at("swap_used")  = 0;
-        mem.stats.at("swap_free")  = 0;
-        has_swap = false;
+		// read from /proc/vm/stats
+		ifstream meminfo(Shared::procPath / "vm/stats");
+		if (meminfo.good()) {
+			uint64_t cacheRam = 0;
+			while (not meminfo.eof()) {
+				string label, value_s;
+				getline(meminfo, label, '=');
+				getline(meminfo, value_s, ' ');
+				// some entries are name=val (size), and some are name=val
+				if (value_s.length() == 0) getline(meminfo, value_s, '\n');
+				else meminfo.ignore(SSmax, '\n');
+				// if it's still 0, we can't parse the line, just skip
+				if (value_s.length() == 0) continue;
 
-        if (total > 0) {
-            for (const auto& name : mem_names) {
-                mem.percent.at(name).push_back(
-                    (long long)round((double)mem.stats.at(name) * 100.0 / (double)total));
-                while (cmp_greater(mem.percent.at(name).size(),
-                                   (size_t)Mem::width * 2 + 2))
-                    mem.percent.at(name).pop_front();
-            }
-        }
+				uint64_t value = std::stoul(value_s, nullptr, 16) * Shared::pageSize;
 
-        if (Config::getB("show_disks")) {
-            auto& disks = mem.disks;
-            const auto& disks_filter = Config::getS("disks_filter");
-            vector<string> filter;
-            bool filter_exclude = false;
-            if (not disks_filter.empty()) {
-                filter = ssplit(disks_filter);
-                if (filter.at(0).starts_with("exclude=")) {
-                    filter_exclude = true;
-                    filter.at(0) = filter.at(0).substr(8);
-                }
-            }
+				if (label == "page_count") {
+					totalRam = value;
+				} else if (label == "pages_allocated") {
+					mem.stats.at("used") = value;
+				} else if (label == "pages_free") {
+					mem.stats.at("free") = value;
+				} else if (label == "cache_object") {
+					cacheRam += value;
+				} else if (label == "cache_shmem") {
+					cacheRam += value;
+				}
+			}
+			
+			mem.stats.at("cached") = cacheRam;
+			mem.stats.at("available") = mem.stats.at("free") + cacheRam;
+		}else {
+			throw std::runtime_error("Failed to read /proc/vm/stats");
+		}
+		meminfo.close();
 
-            vector<string> found;
-            {
-                // QNX has no /proc/mounts; parse the output of the `mount` command instead.
-                // Output format: "<device> on <mountpoint> type <fstype> [options]"
-                FILE* mf = popen("mount", "r");
-                if (mf != nullptr) {
-                    char line[1024];
-                    while (fgets(line, sizeof(line), mf) != nullptr) {
-                        // Tokenise: dev=token[0], "on"=token[1], mp=token[2], "type"=token[3], fstype=token[4]
-                        std::istringstream iss(line);
-                        std::string dev, on, mp, type_kw, fstype;
-                        if (not (iss >> dev >> on >> mp >> type_kw >> fstype)) continue;
-                        if (on != "on" or type_kw != "type") continue;
+		// /proc/vm/stats doesn't show swap information
+		mem.stats.at("swap_total") = 0;
+		mem.stats.at("swap_used") = 0;
+		mem.stats.at("swap_free") = 0;
+		has_swap = false;
 
-                        // Strip parenthesised options appended to fstype e.g. "dos (fat16)"
-                        // fstype itself may already be clean; options follow as next tokens.
+		if (totalRam > 0) {
+			for (const auto& name : mem_names) {
+				mem.percent.at(name).push_back(round((double)mem.stats.at(name) * 100 / totalRam));
+				while (cmp_greater(mem.percent.at(name).size(), width * 2)) mem.percent.at(name).pop_front();
+			}
+		}
 
-                        // Skip virtual / non-storage filesystems
-                        if (is_in(fstype, "shmem"s, "proc"s, "tmpfs"s, "devfs"s,
-                                  "autofs"s, "procfs"s))
-                            continue;
+		if (show_disks) {
+			auto &disks = mem.disks;
+			const auto &disks_filter = Config::getS("disks_filter");
+			vector<string> filter;
+			bool filter_exclude = false;
+			if (not disks_filter.empty()) {
+				filter = ssplit(disks_filter);
+				if (filter.at(0).starts_with("exclude=")) {
+					filter_exclude = true;
+					filter.at(0) = filter.at(0).substr(8);
+				}
+			}
 
-                        if (not filter.empty()) {
-                            bool match = v_contains(filter, mp);
-                            if ((filter_exclude and match) or (not filter_exclude and not match))
-                                continue;
-                        }
+			vector<string> found;
+			{
+				// QNX has no /proc/mounts; parse the output of the `mount` command
+				// instead. Output format: "<device> on <mountpoint> type <fstype>
+				// [options]"
+				FILE *mf = popen("mount", "r");
+				if (mf != nullptr) {
+				char line[1024];
+				while (fgets(line, sizeof(line), mf) != nullptr) {
+					// Tokenise: dev=token[0], "on"=token[1], mp=token[2],
+					// "type"=token[3], fstype=token[4]
+					std::istringstream iss(line);
+					std::string dev, on, mp, type_kw, fstype;
+					if (not(iss >> dev >> on >> mp >> type_kw >> fstype)) continue;
+					if (on != "on" or type_kw != "type") continue;
 
-                        found.push_back(mp);
-                        if (not disks.contains(mp)) {
-                            std::error_code ec;
-                            fs::path dev_path = fs::canonical(dev, ec);
-                            string disk_name = (mp == "/") ? "root"s
-                                             : fs::path(mp).filename().string();
-                            disks[mp] = disk_info{dev_path, disk_name};
-                            if (disks.at(mp).dev.empty()) disks.at(mp).dev = dev;
-                            disks.at(mp).fstype = fstype;
-                        }
+					// Skip virtual / non-storage filesystems
+					if (is_in(fstype, "shmem"s, "proc"s, "tmpfs"s, "devfs"s, "autofs"s, "procfs"s, "ifs"s)) continue;
 
-                        struct statvfs vfs{};
-                        if (statvfs(mp.c_str(), &vfs) == 0 and vfs.f_blocks > 0) {
-                            auto& disk = disks.at(mp);
-                            disk.total = (int64_t)vfs.f_blocks * (int64_t)vfs.f_frsize;
-                            disk.free  = (int64_t)vfs.f_bfree  * (int64_t)vfs.f_frsize;
-                            disk.used  = disk.total - disk.free;
-                            disk.used_percent = (int)round((double)disk.used  * 100.0 / disk.total);
-                            disk.free_percent = 100 - disk.used_percent;
-                        }
-                    }
-                    pclose(mf);
-                }
-            }
+					if (not filter.empty()) {
+					bool match = v_contains(filter, mp);
+					if ((filter_exclude and match) or (not filter_exclude and not match))
+						continue;
+					}
 
-            for (auto it = disks.begin(); it != disks.end();) {
-                if (not v_contains(found, it->first)) it = disks.erase(it);
-                else ++it;
-            }
-            if (found.size() != last_found.size()) redraw = true;
-            last_found = std::move(found);
+					found.push_back(mp);
+					if (not disks.contains(mp)) {
+						std::error_code ec;
+						fs::path dev_path = fs::canonical(dev, ec);
+						string disk_name = (mp == "/") ? "root"s : fs::path(mp).filename().string();
+						disks[mp] = disk_info{dev_path, disk_name};
+						if (disks.at(mp).dev.empty()) disks.at(mp).dev = dev;
+						disks.at(mp).fstype = fstype;
+					}
 
-            mem.disks_order.clear();
-            if (disks.contains("/")) mem.disks_order.push_back("/");
-            for (const auto& mp : last_found)
-                if (mp != "/") mem.disks_order.push_back(mp);
+					struct statvfs vfs{};
+					if (statvfs(mp.c_str(), &vfs) == 0 and vfs.f_blocks > 0) {
+						auto &disk = disks.at(mp);
+						disk.total = (int64_t)vfs.f_blocks * (int64_t)vfs.f_frsize;
+						disk.free = (int64_t)vfs.f_bfree * (int64_t)vfs.f_frsize;
+						disk.used = disk.total - disk.free;
+						disk.used_percent = (int)round((double)disk.used * 100.0 / disk.total);
+						disk.free_percent = 100 - disk.used_percent;
+					}
+				}
+				pclose(mf);
+				}
+			}
 
-            disk_ios = 0;
-        }
+			for (auto it = disks.begin(); it != disks.end();) {
+				if (not v_contains(found, it->first))
+				it = disks.erase(it);
+				else
+				++it;
+			}
+			if (found.size() != last_found.size())
+				redraw = true;
+			last_found = std::move(found);
 
-        return mem;
-    }
+			mem.disks_order.clear();
+			if (disks.contains("/"))
+				mem.disks_order.push_back("/");
+			for (const auto &mp : last_found)
+				if (mp != "/")
+				mem.disks_order.push_back(mp);
+
+			disk_ios = 0;
+		}
+
+		return mem;
+	}
+
 } // namespace Mem
 
-// ---------------------------------------------------------------------------
-// Net namespace
-// ---------------------------------------------------------------------------
 
 namespace Net {
     std::unordered_map<string, net_info> current_net;
@@ -853,7 +843,7 @@ namespace Proc {
                     }
 
                     np.ppid  = (uint64_t)info.parent;
-                    np.cpu_s = (uint64_t)(boot_time_sec +
+                    np.cpu_s = (uint64_t)(Mem::old_uptime +
                                           (time_t)(info.start_time / 1'000'000'000ULL));
 
                     uid_t uid = (uid_t)info.uid;
@@ -884,7 +874,7 @@ namespace Proc {
                     const char* p = std::strstr(vs.c_str(), "as_stats.rss=");
                     uint64_t rss = 0;
                     if (p) rss = std::strtoull(p + std::strlen("as_stats.rss="), nullptr, 0);
-                    np.mem = rss * (uint64_t)Shared::page_size;
+                    np.mem = rss * (uint64_t)Shared::pageSize;
                 }
 
                 // CPU%
