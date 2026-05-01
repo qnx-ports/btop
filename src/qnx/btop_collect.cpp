@@ -40,6 +40,7 @@ tab-size = 4
 #include <sys/statvfs.h>
 #include <sys/sysctl.h> // required
 #include <sys/types.h>
+#include <sys/stat.h> // required
 #include <unistd.h>
 
 // ---- C++ Standard Library ----
@@ -87,19 +88,6 @@ uint64_t cpu_collect_ms = 0;
 // time_ms() reading when the previous Proc::collect cycle completed (set by Proc::collect).
 uint64_t proc_collect_ms = 0;
 
-
-// Read a small /proc text file into a string (returns "" on error).
-std::string read_proc_file(const std::string& path) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) return {};
-    char buf[4096];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return {};
-    buf[n] = '\0';
-    return buf;
-}
-
 } // anonymous namespace
 
 namespace Cpu {
@@ -138,7 +126,7 @@ namespace Mem {
 
 namespace Shared {
 	fs::path procPath;
-	long coreCount, pageSize, clk_tck;
+	long coreCount, page_size, clk_tck;
 
 	void init() {
 		//? Shared global variables init
@@ -154,9 +142,9 @@ namespace Shared {
 		}
 
 		// Page size
-		pageSize = sysconf(_SC_PAGE_SIZE);
-		if (pageSize <= 0) {
-			pageSize = 4096;
+		page_size = sysconf(_SC_PAGE_SIZE);
+		if (page_size <= 0) {
+			page_size = 4096;
 			Logger::warning("Could not get system page size. Defaulting to 4096, processes memory usage might be incorrect.");
 		}
 
@@ -310,7 +298,7 @@ namespace Mem {
 
 				uint64_t value;
 				try {
-					 value = std::stoul(value_s, nullptr, 16) * Shared::pageSize;
+					 value = std::stoul(value_s, nullptr, 16) * Shared::page_size;
 				} catch(...) {
 					continue;
 				}
@@ -905,19 +893,19 @@ namespace Proc {
                 new_proc.threads = info.num_threads;
 
 				// Take the state from TID1
-				procfs_status st{};
-				st.tid = 1;
-				if (devctl(ctl_fd, DCMD_PROC_TIDSTATUS, &st, sizeof(st), nullptr) == EOK) {
-					new_proc.state = qnx_proc_states.at(st.state);
+				procfs_status procstatus{};
+				procstatus.tid = 1;
+				if (devctl(ctl_fd, DCMD_PROC_TIDSTATUS, &procstatus, sizeof(procstatus), nullptr) == EOK) {
+					new_proc.state = qnx_proc_states.at(procstatus.state);
 				} else new_proc.state = 'U'; // If we can't get TIDSTATUS just set it to unkown
 
                 // RSS memory from /proc/<pid>/vmstat
                 {
-                    std::string vs = read_proc_file("/proc/" + std::to_string(pid) + "/vmstat");
-                    const char* p = std::strstr(vs.c_str(), "as_stats.rss=");
-                    uint64_t rss = 0;
-                    if (p) rss = std::strtoull(p + std::strlen("as_stats.rss="), nullptr, 0);
-                    new_proc.mem = rss * Shared::pageSize;
+					new_proc.mem = 0;
+					procfs_asinfo asinfo{};
+					if (devctl(ctl_fd, DCMD_PROC_ASINFO, &asinfo, sizeof(asinfo), nullptr) == EOK) {
+						new_proc.mem = asinfo.rss;
+					}
                 }
 
                 // CPU%
