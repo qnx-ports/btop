@@ -100,27 +100,31 @@ std::string read_proc_file(const std::string& path) {
     return buf;
 }
 
-// Update exponential moving-average load estimates.
-// runnable = number of threads in RUNNING or READY state across all processes.
-void update_load_avg(double runnable) {
-}
-
 } // anonymous namespace
 
 namespace Cpu {
     vector<long long> core_old_totals;
     vector<long long> core_old_idles;
-    vector<string>    available_fields = {"Auto", "total", "user", "system"};
-    vector<string>    available_sensors = {"Auto"};
-    cpu_info          current_cpu;
-    bool              got_sensors    = false;
-    bool              cpu_temp_only  = false;
-    bool              supports_watts = false;
-    bool              has_battery    = false;
-    string            cpuName;
-    string            cpuHz;
-    std::unordered_map<int, int>       core_mapping;
+    vector<string> available_fields = {"Auto", "total", "user", "system"};
+    vector<string> available_sensors = {"Auto"};
+    cpu_info current_cpu;
+    string cpuName;
+    string cpuHz;
     tuple<int, float, long, string>    current_bat = {0, 0.0f, 0L, "not_found"};
+	bool got_sensors = false, cpu_temp_only = false, supports_watts = false, has_battery = false;
+
+	// Sadly we do not have the getloadavg() function
+	/*
+	   We also can't really calculate this easily in btop since being
+	   an RTOS, our threads are almost always signal blocked If we wanted to
+	   get a proper BSD-style load average, we would need see every time a
+	   thread enters either READY or RUNNING. Since we are bound by the
+	   refresh rate of btop, we will miss most occurences of this, making
+	   any number we come up with complete bogus.
+	   */
+	bool has_loadavg = false;
+    std::unordered_map<int, int> core_mapping;
+
 
     // Forward-declare collect so Shared::init can call it.
     auto collect(bool no_update) -> cpu_info&;
@@ -131,11 +135,6 @@ namespace Cpu {
 namespace Mem {
 	double old_uptime;
 } 
-
-namespace Proc {
-	// need to forward declare for Cpu namespace
-	static double load_avg_vals[3] = {0.0, 0.0, 0.0};
-} // nameespace Proc
 
 namespace Shared {
 	fs::path procPath;
@@ -267,14 +266,9 @@ namespace Cpu {
             while (cmp_greater(dq.size(), (size_t)Cpu::width * 2 + 2))
                 dq.pop_front();
         };
-        push("total",  (long long)round(avg));
-        push("user",   (long long)round(avg));
+        push("total",(long long)round(avg));
+        push("user", (long long)round(avg));
         push("system", 0LL);
-
-        // Load average: read from /proc/loadavg if available, else use our EMA.
-                cpu.load_avg[0] = Proc::load_avg_vals[0];
-                cpu.load_avg[1] = Proc::load_avg_vals[1];
-                cpu.load_avg[2] = Proc::load_avg_vals[2];
 
         return cpu;
     }
@@ -747,9 +741,6 @@ namespace Proc {
 		{ 'U', "Unknown"},
 	};
 
-	// states that participate in the long average
-	static std::unordered_set<uint> qnx_runnable_states = {STATE_READY, STATE_RUNNING};
-
 	//* Get detailed info for selected process
 	void _collect_details(const size_t pid, vector<proc_info> &procs) {
 		if (pid != detailed.last_pid) {
@@ -840,9 +831,6 @@ namespace Proc {
 				proc_clear_count = 0;
 			}
 
-            // Count runnable threads for load-avg EMA
-            double runnable_count = 0.0;
-
             std::error_code dir_errorcode;
             for (const fs::path &dir_entry : fs::directory_iterator(Shared::procPath, dir_errorcode)) {
                 if (dir_errorcode) continue;
@@ -921,7 +909,6 @@ namespace Proc {
 				st.tid = 1;
 				if (devctl(ctl_fd, DCMD_PROC_TIDSTATUS, &st, sizeof(st), nullptr) == EOK) {
 					new_proc.state = qnx_proc_states.at(st.state);
-					if (qnx_runnable_states.contains(st.state)) runnable_count += 1.0;
 				} else new_proc.state = 'U'; // If we can't get TIDSTATUS just set it to unkown
 
                 // RSS memory from /proc/<pid>/vmstat
@@ -964,24 +951,6 @@ namespace Proc {
                 if (show_detailed and not got_detailed and new_proc.pid == dpid)
                     got_detailed = true;
             }
-
-			// We don't have getloadavg so we must calculate loda average by hand :(
-			do {
-				uint64_t now_ms = time_ms();
-				if (load_avg_last_ms == 0) {
-					load_avg_vals[0] = load_avg_vals[1] = load_avg_vals[2] = runnable_count;
-					load_avg_last_ms = now_ms;
-					break;
-				}
-				double dt = (double)(now_ms - load_avg_last_ms) / 1000.0;
-				load_avg_last_ms = now_ms;
-
-				constexpr double T[3] = {60.0, 300.0, 900.0};
-				for (int i = 0; i < 3; i++) {
-					double alpha = std::exp(-dt / T[i]);
-					load_avg_vals[i] = load_avg_vals[i] * alpha + runnable_count * (1.0 - alpha);
-				}
-			} while(0);
 
             // Remove dead entries
             if (not pause_list) {
