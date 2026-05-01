@@ -20,7 +20,7 @@ tab-size = 4
 #include <sys/syspage.h>
 #include <sys/neutrino.h>
 #include <sys/procfs.h>
-#include <sys/states.h>
+#include <sys/states.h> // required
 #include <sys/mman.h>
 #include <sys/utsname.h>
 #include <devctl.h>
@@ -87,20 +87,6 @@ uint64_t cpu_collect_ms = 0;
 // time_ms() reading when the previous Proc::collect cycle completed (set by Proc::collect).
 uint64_t proc_collect_ms = 0;
 
-// Load average state (exponential moving average over 1/5/15 min).
-double load_avg_vals[3] = {0.0, 0.0, 0.0};
-uint64_t load_avg_last_ms = 0;
-
-// Translate a QNX thread state code to the single-char state btop uses.
-char qnx_state_char(unsigned int s) {
-    switch (s) {
-        case STATE_RUNNING:  return 'R';
-        case STATE_READY:    return 'R';
-        case STATE_STOPPED:  return 'T';
-        case STATE_DEAD:     return 'Z';
-        default:             return 'S';
-    }
-}
 
 // Read a small /proc text file into a string (returns "" on error).
 std::string read_proc_file(const std::string& path) {
@@ -117,21 +103,6 @@ std::string read_proc_file(const std::string& path) {
 // Update exponential moving-average load estimates.
 // runnable = number of threads in RUNNING or READY state across all processes.
 void update_load_avg(double runnable) {
-    uint64_t now_ms = time_ms();
-    if (load_avg_last_ms == 0) {
-        load_avg_vals[0] = load_avg_vals[1] = load_avg_vals[2] = runnable;
-        load_avg_last_ms = now_ms;
-        return;
-    }
-    double dt = (double)(now_ms - load_avg_last_ms) / 1000.0;
-    load_avg_last_ms = now_ms;
-
-    // Windows: 1, 5, 15 minutes in seconds
-    constexpr double T[3] = {60.0, 300.0, 900.0};
-    for (int i = 0; i < 3; i++) {
-        double alpha = std::exp(-dt / T[i]);
-        load_avg_vals[i] = load_avg_vals[i] * alpha + runnable * (1.0 - alpha);
-    }
 }
 
 } // anonymous namespace
@@ -161,12 +132,13 @@ namespace Mem {
 	double old_uptime;
 } 
 
-// ---------------------------------------------------------------------------
-// Shared::init
-// ---------------------------------------------------------------------------
+namespace Proc {
+	// need to forward declare for Cpu namespace
+	static double load_avg_vals[3] = {0.0, 0.0, 0.0};
+} // nameespace Proc
 
 namespace Shared {
-	fs::path procPath, passwd_path;
+	fs::path procPath;
 	long coreCount, pageSize, clk_tck;
 
 	void init() {
@@ -174,9 +146,6 @@ namespace Shared {
 		procPath = (fs::is_directory(fs::path("/proc")) and access("/proc", R_OK) != -1) ? "/proc" : "";
 		if (procPath.empty())
 			throw std::runtime_error( "Proc filesystem not found or no permission to read from it!");
-		passwd_path = (fs::is_regular_file(fs::path("/etc/passwd")) and access("/etc/passwd", R_OK) != -1) ? "/etc/passwd" : "";
-		if (passwd_path.empty())
-			Logger::warning( "Could not read /etc/passwd, will show UID instead of username.");
 
 		// CPU count No difference between physical and core count on QNX
 		coreCount = (long)_syspage_ptr->num_cpu;
@@ -303,20 +272,9 @@ namespace Cpu {
         push("system", 0LL);
 
         // Load average: read from /proc/loadavg if available, else use our EMA.
-        {
-            std::string la_str = read_proc_file("/proc/loadavg");
-            double la[3] = {0, 0, 0};
-            if (not la_str.empty() and
-                std::sscanf(la_str.c_str(), "%lf %lf %lf", &la[0], &la[1], &la[2]) == 3) {
-                cpu.load_avg[0] = la[0];
-                cpu.load_avg[1] = la[1];
-                cpu.load_avg[2] = la[2];
-            } else {
-                cpu.load_avg[0] = load_avg_vals[0];
-                cpu.load_avg[1] = load_avg_vals[1];
-                cpu.load_avg[2] = load_avg_vals[2];
-            }
-        }
+                cpu.load_avg[0] = Proc::load_avg_vals[0];
+                cpu.load_avg[1] = Proc::load_avg_vals[1];
+                cpu.load_avg[2] = Proc::load_avg_vals[2];
 
         return cpu;
     }
@@ -356,7 +314,12 @@ namespace Mem {
 				// if it's still 0, we can't parse the line, just skip
 				if (value_s.length() == 0) continue;
 
-				uint64_t value = std::stoul(value_s, nullptr, 16) * Shared::pageSize;
+				uint64_t value;
+				try {
+					 value = std::stoul(value_s, nullptr, 16) * Shared::pageSize;
+				} catch(...) {
+					continue;
+				}
 
 				if (label == "page_count") {
 					totalRam = value;
@@ -697,96 +660,166 @@ namespace Net {
 } // namespace Net
 
 namespace Proc {
-    vector<proc_info>                   current_procs;
-    std::unordered_map<string, string>  uid_user;
-    string  current_sort;
-    string  current_filter;
-    bool    current_rev      = false;
-    bool    is_tree_mode     = false;
-    int     collapse         = -1;
-    int     expand           = -1;
-    int     toggle_children  = -1;
-    atomic<int> numpids      = 0;
-    int     filter_found     = 0;
+    vector<proc_info> current_procs;
+    std::unordered_map<string, string> uid_user;
+    string current_sort;
+    string current_filter;
+    bool current_rev = false;
+    bool is_tree_mode = false;
+	constexpr size_t KTHREADD = 1;
+	static std::unordered_set<size_t> kernels_procs = {KTHREADD};
+
+    int collapse = -1, expand = -1, toggle_children = -1;
+    atomic<int> numpids = 0;
+    int filter_found = 0;
 
     detail_container detailed;
     static std::unordered_set<size_t> dead_procs;
 
-    static string get_status(char s) {
-        switch (s) {
-            case 'R': return "Running";
-            case 'T': return "Stopped";
-            case 'Z': return "Zombie";
-            case 'S': return "Sleeping";
-            default:  return "Unknown";
-        }
-    }
+	uint64_t load_avg_last_ms = 0;
 
-    static void _collect_details(size_t pid, vector<proc_info>& procs) {
-        if (pid != detailed.last_pid) {
-            detailed = {};
-            detailed.last_pid = pid;
-            detailed.skip_smaps = not Config::getB("proc_info_smaps");
-        }
+	// best attempt at mapping each state to a unique char...
+	const std::unordered_map<uint, char> qnx_proc_states = {
+		{ STATE_DEAD,			'D' },
+		{ STATE_RUNNING,		'r' },
+		{ STATE_READY,			'R' },
+		{ STATE_STOPPED,		'S' },
+		{ STATE_SEND,			'>' },  // arrow out, like sending
+		{ STATE_RECEIVE,		'<' },  // arrow in, like receiving
+		{ STATE_REPLY,			'=' },  // equal, a reply for a response
+		{ STATE_MQ_SEND,		')' },  // like Send and Receive, but () 
+		{ STATE_MQ_RECEIVE,		'(' },  // because q is round
+		{ STATE_WAITPAGE,		'W' },  
+		{ STATE_SIGSUSPEND,		'x' },  // suspend is mild destroy
+		{ STATE_SIGWAITINFO,	'.' },  // . is like a loading ellipsis
+		{ STATE_NANOSLEEP,		'n' },  
+		{ STATE_MUTEX,			'M' },  
+		{ STATE_CONDVAR,		'C' },  
+		{ STATE_JOIN,			'J' },  
+		{ STATE_INTR,			'i' },  
+		{ STATE_SEM,			's' },  
+		{ STATE_WAITCTX,		'w' },  
+		{ STATE_RWLOCK_READ,	'[' },  // Like MqSend and MqReceive but lock
+		{ STATE_RWLOCK_WRITE,	']' },  // sounds like block, so square braces
+		{ STATE_BARRIER,		'B' },  
+		{ STATE_PIPE,			'|' },  // pipe symbol
+		{ STATE_TIMEOUT_MAX,	'T' },  
+		{ STATE_CREATE,			'c' },  
+		{ STATE_DESTROY,		'X' },  // Cross it out to destroy
+		{ STATE_MUON_MUTEX,		'u' },  
+		{ STATE_TRACEBUFFER,	'-' },  // trace, like a line
+		{ STATE_INTR_ATTACH_EV,	'I' },  
+		{ STATE_TIMER_DELEGATE,	'd' },  // d for delegate
+		// State Unknown is not here, but it is represented with U
+	};
 
-        auto p_it = rng::find(procs, pid, &proc_info::pid);
-        if (p_it == procs.end()) return;
-        detailed.entry = *p_it;
+	const std::unordered_map<char, string> qnx_detailed_proc_states = {
+		{ 'D', "Dead" },
+		{ 'r', "Running" },
+		{ 'R', "Ready" },
+		{ 'S', "Stopped" },
+		{ '>', "Send" },
+		{ '<', "Receive" },
+		{ '=', "Reply" },
+		{ ')', "MqSend" },
+		{ '(', "MqReceive" },
+		{ 'W', "Waitpage" },
+		{ 'x', "Sigsuspend" },
+		{ '.', "Sigwaitinfo" },
+		{ 'n', "Nanosleep" },
+		{ 'M', "Mutex" },
+		{ 'C', "Condvar" },
+		{ 'J', "Join" },
+		{ 'i', "Intr" },
+		{ 's', "Sem" },
+		{ 'w', "Waitctx" },
+		{ '[', "RwlockRead" },
+		{ ']', "RwlockWrite" },
+		{ 'B', "Barrier" },
+		{ '|', "Pipe" },
+		{ 'T', "TimeoutMax" },
+		{ 'c', "Create" },
+		{ 'X', "Destroy" },
+		{ 'u', "MuonMutex" },
+		{ '-', "Tracebuffer" },
+		{ 'I', "IntrAttachEv" },
+		{ 'd', "TimerDelegate" },
+		{ 'U', "Unknown"},
+	};
 
-        if (not Config::getB("proc_per_core"))
-            detailed.entry.cpu_p *= Shared::coreCount;
+	// states that participate in the long average
+	static std::unordered_set<uint> qnx_runnable_states = {STATE_READY, STATE_RUNNING};
 
-        detailed.cpu_percent.push_back(
-            clamp((long long)round(detailed.entry.cpu_p), 0LL, 100LL));
-        while (cmp_greater(detailed.cpu_percent.size(), (size_t)width))
-            detailed.cpu_percent.pop_front();
+	//* Get detailed info for selected process
+	void _collect_details(const size_t pid, vector<proc_info> &procs) {
+		if (pid != detailed.last_pid) {
+			detailed = {};
+			detailed.last_pid = pid;
+			detailed.skip_smaps = not Config::getB("proc_info_smaps");
+		}
 
-        if (detailed.entry.state != 'X')
-            detailed.elapsed = sec_to_dhms((size_t)(time(nullptr) - (time_t)detailed.entry.cpu_s));
-        else
-            detailed.elapsed = sec_to_dhms(detailed.entry.death_time);
-        if (detailed.elapsed.size() > 8)
-            detailed.elapsed.resize(detailed.elapsed.size() - 3);
+		//? Copy proc_info for process from proc vector
+		auto p_info = rng::find(procs, pid, &proc_info::pid);
+		detailed.entry = *p_info;
 
-        if (detailed.parent.empty()) {
-            auto pe = rng::find(procs, detailed.entry.ppid, &proc_info::pid);
-            if (pe != procs.end()) detailed.parent = pe->name;
-        }
+		//? Update cpu percent deque for process cpu graph
+		if (not Config::getB("proc_per_core")) detailed.entry.cpu_p *= Shared::coreCount;
+		detailed.cpu_percent.push_back(clamp((long long)round(detailed.entry.cpu_p), 0ll, 100ll));
+		while (cmp_greater(detailed.cpu_percent.size(), width)) detailed.cpu_percent.pop_front();
 
-        detailed.status = get_status(detailed.entry.state);
-        detailed.mem_bytes.push_back((long long)detailed.entry.mem);
-        detailed.memory = floating_humanizer(detailed.entry.mem);
+		//? Process runtime : current time - start time (both in unix time - seconds since epoch)
+		struct timeval currentTime;
+		gettimeofday(&currentTime, nullptr);
+		// only interested in second granularity, so ignoring tc_usec
+		if (detailed.entry.state != 'X') detailed.elapsed = sec_to_dhms(currentTime.tv_sec - detailed.entry.cpu_s); 
+		else detailed.elapsed = sec_to_dhms(detailed.entry.death_time);
+		if (detailed.elapsed.size() > 8) detailed.elapsed.resize(detailed.elapsed.size() - 3);
 
-        if (detailed.first_mem == -1
-                or detailed.first_mem < (long long)detailed.mem_bytes.back() / 2
-                or detailed.first_mem > (long long)detailed.mem_bytes.back() * 4) {
-            detailed.first_mem = min((uint64_t)detailed.mem_bytes.back() * 2,
-                                     Mem::get_totalMem());
-            redraw = true;
-        }
-        while (cmp_greater(detailed.mem_bytes.size(), (size_t)width))
-            detailed.mem_bytes.pop_front();
-    }
+		//? Get parent process name
+		if (detailed.parent.empty()) {
+			auto p_entry = rng::find(procs, detailed.entry.ppid, &proc_info::pid);
+			if (p_entry != procs.end()) detailed.parent = p_entry->name;
+		}
+
+		//? Expand process status from single char to explanative string
+		detailed.status = qnx_detailed_proc_states.at(detailed.entry.state);
+
+		detailed.mem_bytes.push_back(detailed.entry.mem);
+		detailed.memory = floating_humanizer(detailed.entry.mem);
+
+		if (detailed.first_mem == -1 or detailed.first_mem < detailed.mem_bytes.back() / 2 or detailed.first_mem > detailed.mem_bytes.back() * 4) {
+			detailed.first_mem = min((uint64_t)detailed.mem_bytes.back() * 2, Mem::get_totalMem());
+			redraw = true;
+		}
+
+		while (cmp_greater(detailed.mem_bytes.size(), width)) detailed.mem_bytes.pop_front();
+	}
 
     auto collect(bool no_update) -> vector<proc_info>& {
-        const auto& sorting       = Config::getS("proc_sorting");
-        auto        rev           = Config::getB("proc_reversed");
-        const auto& filter        = Config::getS("proc_filter");
-        auto        per_core      = Config::getB("proc_per_core");
-        auto        tree          = Config::getB("proc_tree");
-        auto        show_detailed = Config::getB("show_detailed");
-        auto        pause_list    = Config::getB("pause_proc_list");
-        const size_t dpid         = (size_t)Config::getI("detailed_pid");
+		const auto &sorting = Config::getS("proc_sorting");
+		auto rev = Config::getB("proc_reversed");
+		const auto &filter = Config::getS("proc_filter");
+		auto per_core = Config::getB("proc_per_core");
+		auto should_filter_kernel = Config::getB("proc_filter_kernel");
+		auto tree = Config::getB("proc_tree");
+		auto show_detailed = Config::getB("show_detailed");
+		const auto pause_list = Config::getB("pause_proc_list");
+		const size_t dpid = Config::getI("detailed_pid");
 
-        bool should_filter  = (current_filter != filter);
-        if (should_filter)  current_filter = filter;
-        bool sorted_change    = (sorting != current_sort or rev != current_rev or should_filter);
+        bool should_filter = (current_filter != filter);
+        if (should_filter) current_filter = filter;
+        bool sorted_change = (sorting != current_sort or rev != current_rev or should_filter);
         bool tree_mode_change = (tree != is_tree_mode);
-        if (sorted_change)    { current_sort = sorting; current_rev = rev; }
+        if (sorted_change) {
+			current_sort = sorting;
+			current_rev = rev; 
+		}
         if (tree_mode_change) is_tree_mode = tree;
 
         const int cmult = per_core ? (int)Shared::coreCount : 1;
         bool got_detailed = false;
+
+		static size_t proc_clear_count{};
 
         static vector<size_t> found;
         uint64_t now_ms = time_ms();
@@ -798,18 +831,35 @@ namespace Proc {
             should_filter = true;
             found.clear();
 
+			//? First make sure kernel proc cache is cleared.
+			if (should_filter_kernel and ++proc_clear_count >= 256) {
+				//? Clearing the cache is used in the event of a pid wrap around.
+				//? In that event processes that acquire old kernel pids would also be filtered out so we need to manually clean the cache every now and then.
+				kernels_procs.clear();
+				kernels_procs.emplace(KTHREADD);
+				proc_clear_count = 0;
+			}
+
             // Count runnable threads for load-avg EMA
             double runnable_count = 0.0;
 
-            std::error_code dir_ec;
-            for (const auto& dent : fs::directory_iterator("/proc", dir_ec)) {
-                if (dir_ec) break;
-                const auto& fname = dent.path().filename().string();
-                if (fname.empty() or not std::isdigit((unsigned char)fname[0])) continue;
+            std::error_code dir_errorcode;
+            for (const fs::path &dir_entry : fs::directory_iterator(Shared::procPath, dir_errorcode)) {
+                if (dir_errorcode) continue;
+                const auto &proc_pid = dir_entry.filename().string();
+                if (proc_pid.empty() or not std::isdigit((unsigned char)proc_pid[0])) continue;
 
                 size_t pid = 0;
-                try { pid = std::stoul(fname); } catch (...) { continue; }
+                try {
+					pid = std::stoul(proc_pid); 
+				} catch (...) {
+					continue; 
+				}
                 if (pid < 1) continue;
+
+				if (should_filter_kernel and kernels_procs.contains(pid)) {
+					continue;
+				}
 
                 found.push_back(pid);
 
@@ -823,91 +873,56 @@ namespace Proc {
                     } else continue;
                 } else if (dead_procs.contains(pid)) continue;
 
-                auto& np = *find_old;
+                auto& new_proc = *find_old;
 
-                std::string as_path = "/proc/" + std::to_string(pid) + "/as";
-                int as_fd = open(as_path.c_str(), O_RDONLY);
-                if (as_fd < 0) {
-                    // /proc/<pid>/as is not accessible (e.g. another user's process
-                    // and we are not root).  We can still populate name/cmd from
-                    // /proc/<pid>/cmdline which is world-readable on QNX.
-                    if (no_cache) {
-                        std::string cl = read_proc_file("/proc/" + std::to_string(pid) + "/cmdline");
-                        for (auto& c : cl) if (c == '\0') c = ' ';
-                        while (not cl.empty() and cl.back() == ' ') cl.pop_back();
-                        if (not cl.empty()) {
-                            // First NUL-separated token is argv[0]; use its basename as name.
-                            std::string argv0 = cl.substr(0, cl.find(' '));
-                            np.name = fs::path(argv0).filename().string();
-                            np.cmd  = cl;
-                            if (np.cmd.size() > 1000) { np.cmd.resize(1000); np.cmd.shrink_to_fit(); }
-                        } else {
-                            np.name = "[" + std::to_string(pid) + "]";
-                            np.cmd  = np.name;
-                        }
-                    }
-                    np.state = 'S';
-                    continue;
-                }
+				fs::path ctl_path = dir_entry / "ctl";
+                int ctl_fd = open(ctl_path.c_str(), O_RDONLY);
 
                 procfs_info info{};
-                if (devctl(as_fd, DCMD_PROC_INFO, &info, sizeof(info), nullptr) != EOK) {
-                    close(as_fd); continue;
+                if (devctl(ctl_fd, DCMD_PROC_INFO, &info, sizeof(info), nullptr) != EOK) {
+                    close(ctl_fd);
+					continue;
                 }
 
-                if (no_cache) {
-                    // Name: use DCMD_PROC_MAPDEBUG_BASE on the already-open as_fd so
-                    // that this works without root (reading /proc/<pid>/exefile fails
-                    // for other users' processes when not root).
-                    struct {
-                        procfs_debuginfo hdr;
-                        char             path[PATH_MAX];
-                    } dbg{};
-                    dbg.hdr.vaddr = info.base_address;
-                    std::string exe_path;
-                    if (devctl(as_fd, DCMD_PROC_MAPDEBUG_BASE, &dbg, sizeof(dbg), nullptr) == EOK
-                            and dbg.hdr.path[0] != '\0') {
-                        exe_path = dbg.hdr.path;
-                    }
-                    np.name = exe_path.empty()
-                        ? "[" + std::to_string(pid) + "]"
-                        : fs::path(exe_path).filename().string();
+				if (no_cache) {
+					// we need to define this struct since devctl fills the hdr field and then adds the path after.
+					struct {
+						procfs_debuginfo hdr;
+						char             path[PATH_MAX];
+					} dbg{};
+					// dbg.hdr.vaddr = info.base_address;
+					if (devctl(ctl_fd, DCMD_PROC_MAPDEBUG_BASE, &dbg, sizeof(dbg), nullptr) == EOK) {
+						std::string  exe_path = dbg.hdr.path;
+						if (!exe_path.empty()) {
+							new_proc.name = fs::path(exe_path).filename().string();
+							new_proc.cmd = exe_path;
+						}else {
+							new_proc.name =  "[" + std::to_string(pid) + "]" ;
+						}
+					}
 
-                    // Command line: read from /proc (may be empty if not root);
-                    // fall back to the exe path obtained above via devctl.
-                    {
-                        std::string cl = read_proc_file("/proc/" + std::to_string(pid) + "/cmdline");
-                        for (auto& c : cl) if (c == '\0') c = ' ';
-                        while (not cl.empty() and cl.back() == ' ') cl.pop_back();
-                        np.cmd = cl.empty() ? (exe_path.empty() ? np.name : exe_path) : cl;
-                        if (np.cmd.size() > 1000) { np.cmd.resize(1000); np.cmd.shrink_to_fit(); }
-                    }
+                    new_proc.ppid  = (uint64_t)info.parent;
+                    new_proc.cpu_s = (uint64_t)(Mem::old_uptime + info.start_time / 1e9);
 
-                    np.ppid  = (uint64_t)info.parent;
-                    np.cpu_s = (uint64_t)(Mem::old_uptime +
-                                          (time_t)(info.start_time / 1'000'000'000ULL));
-
-                    uid_t uid = (uid_t)info.uid;
+					// fill in the username from passwd
+                    uid_t uid = info.uid;
                     std::string uid_str = std::to_string(uid);
                     if (not uid_user.contains(uid_str)) {
                         struct passwd* pw = getpwuid(uid);
                         uid_user[uid_str] = pw ? pw->pw_name : uid_str;
                     }
-                    np.user = uid_user.at(uid_str);
+                    new_proc.user = uid_user.at(uid_str);
                 }
 
-                np.threads = (size_t)info.num_threads;
+                new_proc.threads = info.num_threads;
 
-                // State: read TID 1
-                {
-                    procfs_status st{};
-                    st.tid = 1;
-                    if (devctl(as_fd, DCMD_PROC_TIDSTATUS, &st, sizeof(st), nullptr) == EOK) {
-                        np.state = qnx_state_char(st.state);
-                        if (st.state == STATE_RUNNING or st.state == STATE_READY)
-                            runnable_count += 1.0;
-                    } else np.state = 'S';
-                }
+				// Take the state from TID1
+				procfs_status st{};
+				st.tid = 1;
+				if (devctl(ctl_fd, DCMD_PROC_TIDSTATUS, &st, sizeof(st), nullptr) == EOK) {
+					new_proc.state = qnx_proc_states.at(st.state);
+					if (qnx_runnable_states.contains(st.state)) runnable_count += 1.0;
+				} else new_proc.state = 'U'; // If we can't get TIDSTATUS just set it to unkown
 
                 // RSS memory from /proc/<pid>/vmstat
                 {
@@ -915,13 +930,13 @@ namespace Proc {
                     const char* p = std::strstr(vs.c_str(), "as_stats.rss=");
                     uint64_t rss = 0;
                     if (p) rss = std::strtoull(p + std::strlen("as_stats.rss="), nullptr, 0);
-                    np.mem = rss * (uint64_t)Shared::pageSize;
+                    new_proc.mem = rss * Shared::pageSize;
                 }
 
                 // CPU%
                 {
                     uint64_t cpu_ns_now = info.utime + info.stime;
-                    uint64_t cpu_ns_old = np.cpu_t; // repurposed: stores prev total ns
+                    uint64_t cpu_ns_old = new_proc.cpu_t; // repurposed: stores prev total ns
                     uint64_t delta_ns   = (cpu_ns_now >= cpu_ns_old) ? (cpu_ns_now - cpu_ns_old) : 0;
 
                     // Use the interval between the two most-recent process collection
@@ -929,29 +944,44 @@ namespace Proc {
                     // runs just before this), so (now_ms - cpu_collect_ms) would be only
                     // a few milliseconds and would wildly inflate cpu_p.
                     uint64_t int_ns = (proc_collect_ms > 0)
-                        ? ((now_ms - proc_collect_ms) * 1'000'000ULL)
-                        : 1'000'000'000ULL;
-                    if (int_ns == 0) int_ns = 1'000'000'000ULL;
+                        ? ((now_ms - proc_collect_ms) * 1e6)
+                        : 1e9;
+                    if (int_ns == 0) int_ns = 1e9;
 
-                    np.cpu_p = clamp((double)delta_ns / (double)int_ns * 100.0 * cmult,
+                    new_proc.cpu_p = clamp((double)delta_ns / (double)int_ns * 100.0 * cmult,
                                      0.0, 100.0 * (double)Shared::coreCount);
 
-                    double elapsed_s = max(1.0, (double)(time(nullptr) - (time_t)np.cpu_s));
-                    np.cpu_c = ((double)(info.utime + info.stime) / 1e9) / elapsed_s;
+                    double elapsed_s = max(1.0, (double)(time(nullptr) - (time_t)new_proc.cpu_s));
+                    new_proc.cpu_c = ((double)(info.utime + info.stime) / 1e9) / elapsed_s;
 
                     // Store current cpu ns in cpu_t for next cycle delta
-                    np.cpu_t = cpu_ns_now;
+                    new_proc.cpu_t = cpu_ns_now;
                 }
 
-                np.p_nice = 0;
-                close(as_fd);
+                new_proc.p_nice = 0;
+                close(ctl_fd);
 
-                if (show_detailed and not got_detailed and np.pid == dpid)
+                if (show_detailed and not got_detailed and new_proc.pid == dpid)
                     got_detailed = true;
             }
 
-            // Update load average EMA
-            update_load_avg(runnable_count);
+			// We don't have getloadavg so we must calculate loda average by hand :(
+			do {
+				uint64_t now_ms = time_ms();
+				if (load_avg_last_ms == 0) {
+					load_avg_vals[0] = load_avg_vals[1] = load_avg_vals[2] = runnable_count;
+					load_avg_last_ms = now_ms;
+					break;
+				}
+				double dt = (double)(now_ms - load_avg_last_ms) / 1000.0;
+				load_avg_last_ms = now_ms;
+
+				constexpr double T[3] = {60.0, 300.0, 900.0};
+				for (int i = 0; i < 3; i++) {
+					double alpha = std::exp(-dt / T[i]);
+					load_avg_vals[i] = load_avg_vals[i] * alpha + runnable_count * (1.0 - alpha);
+				}
+			} while(0);
 
             // Remove dead entries
             if (not pause_list) {
