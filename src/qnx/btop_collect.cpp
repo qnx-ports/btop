@@ -20,7 +20,7 @@ tab-size = 4
 #include <sys/syspage.h>
 #include <sys/neutrino.h>
 #include <sys/procfs.h>
-#include <sys/states.h> // required
+#include <sys/states.h>
 #include <sys/mman.h>
 #include <sys/utsname.h>
 #include <devctl.h>
@@ -30,7 +30,7 @@ tab-size = 4
 #include <fcntl.h>
 #include <net/if.h>
 #include <net/if_dl.h>
-#include <net/route.h> // required
+#include <net/route.h> 
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -38,9 +38,9 @@ tab-size = 4
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
-#include <sys/sysctl.h> // required
+#include <sys/sysctl.h>
 #include <sys/types.h>
-#include <sys/stat.h> // required
+#include <sys/stat.h>
 #include <unistd.h>
 
 // ---- C++ Standard Library ----
@@ -77,25 +77,9 @@ namespace Cpu {
     vector<string> available_fields = {"total"};
     vector<string> available_sensors = {"Auto"};
     cpu_info current_cpu;
-    string cpuName;
-    string cpuHz;
-    tuple<int, float, long, string>    current_bat = {0, 0.0f, 0L, "not_found"};
-	bool got_sensors = false, cpu_temp_only = false, supports_watts = false, has_battery = false;
 
-	// Sadly we do not have the getloadavg() function
-	/*
-	   We also can't really calculate this easily in btop since being
-	   an RTOS, our threads are almost always signal blocked If we wanted to
-	   get a proper BSD-style load average, we would need see every time a
-	   thread enters either READY or RUNNING. Since we are bound by the
-	   refresh rate of btop, we will miss most occurences of this, making
-	   any number we come up with complete bogus.
-	   */
-	bool has_loadavg = false;
     std::unordered_map<int, int> core_mapping;
 
-
-    // Forward-declare collect so Shared::init can call it.
     auto collect(bool no_update) -> cpu_info&;
     string get_cpuName();
     auto get_core_mapping() -> std::unordered_map<int, int>;
@@ -164,22 +148,62 @@ namespace Shared {
 
 namespace Cpu {
 	uint64_t last_collect_time_ns = 0;
+    string cpuName;
+    string cpuHz;
+    tuple<int, float, long, string> current_bat = {0, 0.0f, 0L, "not_found"};
+	bool got_sensors = false, cpu_temp_only = false, supports_watts = false, has_battery = false;
+    /*
+       Sadly we do not have the getloadavg() function We also can't really
+       calculate this easily in btop since being an RTOS, our threads are almost
+       always signal blocked If we wanted to get a proper BSD-style load
+       average, we would need see every time a thread enters either READY or
+       RUNNING. Since we are bound by the refresh rate of btop, we will miss
+       most occurences of this, making any number we come up with complete
+       bogus.
+       */
+    bool has_loadavg = false;
 
     string get_cpuName() {
 		struct cpuinfo_entry *cpuinfo = _SYSPAGE_ENTRY(_syspage_ptr, cpuinfo);
 		return SYSPAGE_ENTRY(strings)->data + cpuinfo->name;
     }
 
-    string get_cpuHz() { return {}; }
+    string get_cpuHz() { 
+		struct cpuinfo_entry *cpuinfo = _SYSPAGE_ENTRY(_syspage_ptr, cpuinfo);
+		uint32_t speed_mhz = cpuinfo->speed; 
 
-    auto get_core_mapping() -> std::unordered_map<int, int> {
-        std::unordered_map<int, int> m;
-        for (int i = 0; i < (int)Shared::coreCount; i++) m[i] = i;
-        return m;
-    }
+		return std::to_string(speed_mhz / 1000.0).substr(0,5) + "GHz";
+	}
+
+	auto get_core_mapping() -> std::unordered_map<int, int> {
+		std::unordered_map<int, int> core_map;
+		if (cpu_temp_only) return core_map;
+
+		for (long i = 0; i < Shared::coreCount; i++) {
+			core_map[i] = i;
+		}
+
+		//? Apply user set custom mapping if any
+		const auto &custom_map = Config::getS("cpu_core_map");
+		if (not custom_map.empty()) {
+			try {
+				for (const auto &split : ssplit(custom_map)) {
+					const auto vals = ssplit(split, ':');
+					if (vals.size() != 2) continue;
+					int change_id = std::stoi(vals.at(0));
+					int new_id = std::stoi(vals.at(1));
+					if (not core_map.contains(change_id)) continue;
+					core_map.at(change_id) = new_id;
+				}
+			} catch (...) {
+			}
+		}
+
+		return core_map;
+	}
 
     auto get_battery() -> tuple<int, float, long, string> {
-        return {0, 0.0f, 0L, "not_found"};
+		return current_bat;
     }
 
     auto collect(bool no_update) -> cpu_info& {
@@ -207,6 +231,9 @@ namespace Cpu {
 
         // If we measure the kernel busy time, it should give us the cpu idle
         // time (or very close to it) which we can render
+		// For more in depth information, this should be rewritten to sum
+		// up the cputimes of all processes that are not the kernel
+
         for (int i = 0; i < Shared::coreCount; i++) {
 			try {
 				clockid_t cid = ClockId(Proc::KTHREADD, i + 1);
@@ -233,6 +260,13 @@ namespace Cpu {
         last_collect_time_ns = time_now_ns;
 
 		cpu.cpu_percent.at("total").push_back(clamp((long long)round(global_total_percent / Shared::coreCount), 0ll, 100ll));
+
+		if (Config::getB("show_cpu_freq")) {
+			auto hz = get_cpuHz();
+			if (hz != "") {
+				cpuHz = hz;
+			}
+		}
 
         return cpu;
     }

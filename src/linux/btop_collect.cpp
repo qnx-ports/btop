@@ -106,7 +106,6 @@ namespace Cpu {
 	bool got_sensors{};
 	bool cpu_temp_only{};
 	bool supports_watts = true;
-	bool has_loadavg = true;
 
 	//* Populate found_sensors map
 	bool get_sensors();
