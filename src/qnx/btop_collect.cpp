@@ -71,26 +71,10 @@ namespace fs = std::filesystem;
 namespace rng = std::ranges;
 using namespace Tools;
 
-// ---------------------------------------------------------------------------
-// QNX-local helpers (file-scope)
-// ---------------------------------------------------------------------------
-
-namespace {
-
-constexpr unsigned int QNX_MAX_CPUS = 64;
-
-// Idle nanoseconds per CPU, sampled at each Cpu::collect() call.
-uint64_t prev_idle_ns[QNX_MAX_CPUS] = {};
-
-// time_ms() reading when prev_idle_ns was last updated (set by Cpu::collect).
-uint64_t cpu_collect_ms = 0;
-
-} // anonymous namespace
-
 namespace Cpu {
     vector<long long> core_old_totals;
     vector<long long> core_old_idles;
-    vector<string> available_fields = {"Auto", "total", "user", "system"};
+    vector<string> available_fields = {"total"};
     vector<string> available_sensors = {"Auto"};
     cpu_info current_cpu;
     string cpuName;
@@ -120,6 +104,11 @@ namespace Cpu {
 namespace Mem {
 	double old_uptime;
 } 
+
+namespace Proc {
+	constexpr size_t KTHREADD = 1;
+	static std::unordered_set<size_t> kernels_procs = {KTHREADD};
+}
 
 namespace Shared {
 	fs::path procPath;
@@ -173,13 +162,8 @@ namespace Shared {
 	}
 } // namespace Shared
 
-
-
-// ---------------------------------------------------------------------------
-// Cpu namespace — full implementation
-// ---------------------------------------------------------------------------
-
 namespace Cpu {
+	uint64_t last_collect_time_ns = 0;
 
     string get_cpuName() {
 		struct cpuinfo_entry *cpuinfo = _SYSPAGE_ENTRY(_syspage_ptr, cpuinfo);
@@ -208,46 +192,47 @@ namespace Cpu {
         if (cmp_less(cpu.core_percent.size(), (size_t)Shared::coreCount))
             cpu.core_percent.resize((size_t)Shared::coreCount);
 
-        uint64_t now_ms     = time_ms();
-        uint64_t elapsed_ms = (cpu_collect_ms == 0) ? 1000 : (now_ms - cpu_collect_ms);
-        if (elapsed_ms == 0) elapsed_ms = 1;
-        uint64_t elapsed_ns = elapsed_ms * 1'000'000ULL;
+		struct timeval currentTime;
+		gettimeofday(&currentTime, nullptr);
+		const uint64_t time_now_ns = (currentTime.tv_sec * 1e6 + currentTime.tv_usec) * 1e3;
+		uint64_t collect_interval;
+		if (last_collect_time_ns == 0) {
+			collect_interval = Tools::system_uptime() * 1e9;
+		}else {
+			collect_interval = time_now_ns - last_collect_time_ns;
+		}
 
-        double total_busy = 0.0;
-        int    valid      = 0;
+		long long global_total_percent = 0;
+		struct timespec core_kernel_time;
 
-        for (int i = 0; i < (int)Shared::coreCount and i < (int)QNX_MAX_CPUS; i++) {
-            clockid_t cid = ClockId(1, i + 1); // PID=procnto, TID=cpu+1
-            uint64_t  idle_ns = 0;
-            if (cid != (clockid_t)-1)
-                ClockTime(cid, nullptr, &idle_ns);
+        // If we measure the kernel busy time, it should give us the cpu idle
+        // time (or very close to it) which we can render
+        for (int i = 0; i < Shared::coreCount; i++) {
+			try {
+				clockid_t cid = ClockId(Proc::KTHREADD, i + 1);
+				if (cid == -1) continue;
+				clock_gettime(cid, &core_kernel_time);
+				uint64_t idle_ns = core_kernel_time.tv_sec * 1e9 + core_kernel_time.tv_nsec;
 
-            uint64_t delta = (idle_ns >= prev_idle_ns[i]) ? (idle_ns - prev_idle_ns[i]) : 0;
-            prev_idle_ns[i] = idle_ns;
+				uint64_t new_idle_time = idle_ns - core_old_idles.at(i);
+				core_old_idles.at(i) = idle_ns;
 
-            double pct = clamp((1.0 - (double)delta / (double)elapsed_ns) * 100.0, 0.0, 100.0);
+				double core_usage_percent = clamp((1.0 - (double)new_idle_time / collect_interval) * 100.0, 0.0, 100.0);
+				global_total_percent += core_usage_percent;
 
-            cpu.core_percent.at((size_t)i).push_back((long long)round(pct));
-            while (cmp_greater(cpu.core_percent.at((size_t)i).size(),
-                               (size_t)Cpu::width * 2 + 2))
-                cpu.core_percent.at((size_t)i).pop_front();
+				cpu.core_percent.at(i).push_back((long long) round(core_usage_percent));
 
-            total_busy += pct;
-            valid++;
+				//? Reduce size if there are more values than needed for graph
+				if (cpu.core_percent.at(i).size() > 40) cpu.core_percent.at(i).pop_front();
+			} catch (const std::exception &e) {
+				Logger::error("Cpu::collect() : " + (string)e.what());
+				throw std::runtime_error("collect() : " + (string)e.what());
+			}
         }
-        cpu_collect_ms = now_ms;
 
-        double avg = (valid > 0) ? (total_busy / valid) : 0.0;
+        last_collect_time_ns = time_now_ns;
 
-        auto push = [&](const string& key, long long v) {
-            auto& dq = cpu.cpu_percent.at(key);
-            dq.push_back(v);
-            while (cmp_greater(dq.size(), (size_t)Cpu::width * 2 + 2))
-                dq.pop_front();
-        };
-        push("total",(long long)round(avg));
-        push("user", (long long)round(avg));
-        push("system", 0LL);
+		cpu.cpu_percent.at("total").push_back(clamp((long long)round(global_total_percent / Shared::coreCount), 0ll, 100ll));
 
         return cpu;
     }
@@ -347,45 +332,45 @@ namespace Mem {
 				// [options]"
 				FILE *mf = popen("mount", "r");
 				if (mf != nullptr) {
-				char line[1024];
-				while (fgets(line, sizeof(line), mf) != nullptr) {
-					// Tokenise: dev=token[0], "on"=token[1], mp=token[2],
-					// "type"=token[3], fstype=token[4]
-					std::istringstream iss(line);
-					std::string dev, on, mp, type_kw, fstype;
-					if (not(iss >> dev >> on >> mp >> type_kw >> fstype)) continue;
-					if (on != "on" or type_kw != "type") continue;
+					char line[1024];
+					while (fgets(line, sizeof(line), mf) != nullptr) {
+						// Tokenise: dev=token[0], "on"=token[1], mp=token[2],
+						// "type"=token[3], fstype=token[4]
+						std::istringstream iss(line);
+						std::string dev, on, mp, type_kw, fstype;
+						if (not(iss >> dev >> on >> mp >> type_kw >> fstype)) continue;
+						if (on != "on" or type_kw != "type") continue;
 
-					// Skip virtual / non-storage filesystems
-					if (is_in(fstype, "shmem"s, "proc"s, "tmpfs"s, "devfs"s, "autofs"s, "procfs"s, "ifs"s)) continue;
+						// Skip virtual / non-storage filesystems
+						if (is_in(fstype, "shmem"s, "proc"s, "tmpfs"s, "devfs"s, "autofs"s, "procfs"s, "ifs"s)) continue;
 
-					if (not filter.empty()) {
-					bool match = v_contains(filter, mp);
-					if ((filter_exclude and match) or (not filter_exclude and not match))
-						continue;
+						if (not filter.empty()) {
+						bool match = v_contains(filter, mp);
+						if ((filter_exclude and match) or (not filter_exclude and not match))
+							continue;
+						}
+
+						found.push_back(mp);
+						if (not disks.contains(mp)) {
+							std::error_code ec;
+							fs::path dev_path = fs::canonical(dev, ec);
+							string disk_name = (mp == "/") ? "root"s : fs::path(mp).filename().string();
+							disks[mp] = disk_info{dev_path, disk_name};
+							if (disks.at(mp).dev.empty()) disks.at(mp).dev = dev;
+							disks.at(mp).fstype = fstype;
+						}
+
+						struct statvfs vfs{};
+						if (statvfs(mp.c_str(), &vfs) == 0 and vfs.f_blocks > 0) {
+							auto &disk = disks.at(mp);
+							disk.total = (int64_t)vfs.f_blocks * (int64_t)vfs.f_frsize;
+							disk.free = (int64_t)vfs.f_bfree * (int64_t)vfs.f_frsize;
+							disk.used = disk.total - disk.free;
+							disk.used_percent = (int)round((double)disk.used * 100.0 / disk.total);
+							disk.free_percent = 100 - disk.used_percent;
+						}
 					}
-
-					found.push_back(mp);
-					if (not disks.contains(mp)) {
-						std::error_code ec;
-						fs::path dev_path = fs::canonical(dev, ec);
-						string disk_name = (mp == "/") ? "root"s : fs::path(mp).filename().string();
-						disks[mp] = disk_info{dev_path, disk_name};
-						if (disks.at(mp).dev.empty()) disks.at(mp).dev = dev;
-						disks.at(mp).fstype = fstype;
-					}
-
-					struct statvfs vfs{};
-					if (statvfs(mp.c_str(), &vfs) == 0 and vfs.f_blocks > 0) {
-						auto &disk = disks.at(mp);
-						disk.total = (int64_t)vfs.f_blocks * (int64_t)vfs.f_frsize;
-						disk.free = (int64_t)vfs.f_bfree * (int64_t)vfs.f_frsize;
-						disk.used = disk.total - disk.free;
-						disk.used_percent = (int)round((double)disk.used * 100.0 / disk.total);
-						disk.free_percent = 100 - disk.used_percent;
-					}
-				}
-				pclose(mf);
+					pclose(mf);
 				}
 			}
 
@@ -639,8 +624,6 @@ namespace Proc {
     string current_filter;
     bool current_rev = false;
     bool is_tree_mode = false;
-	constexpr size_t KTHREADD = 1;
-	static std::unordered_set<size_t> kernels_procs = {KTHREADD};
 
     int collapse = -1, expand = -1, toggle_children = -1;
     atomic<int> numpids = 0;
@@ -765,7 +748,7 @@ namespace Proc {
 		while (cmp_greater(detailed.mem_bytes.size(), width)) detailed.mem_bytes.pop_front();
 	}
 
-    auto collect(bool no_update) -> vector<proc_info>& {
+    auto collect(bool no_update) -> vector<proc_info> & {
 		const auto &sorting = Config::getS("proc_sorting");
 		auto reverse = Config::getB("proc_reversed");
 		const auto &filter = Config::getS("proc_filter");
