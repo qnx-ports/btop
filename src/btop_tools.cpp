@@ -82,7 +82,7 @@ namespace Term {
 				settings.c_cc[VTIME] = 0;
 			}
 			if (tcsetattr(STDIN_FILENO, TCSANOW, &settings)) return false;
-			if (on) setvbuf(stdin, nullptr, _IOLBF, 0);
+			if (on) setlinebuf(stdin);
 			else setbuf(stdin, nullptr);
 			return true;
 		}
