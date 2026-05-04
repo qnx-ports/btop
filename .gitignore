@@ -50,7 +50,6 @@ stage/
 btop.1
 
 build
-build-qnx
 bin
 btop
 /obj/
