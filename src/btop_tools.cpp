@@ -38,6 +38,9 @@ tab-size = 4
 #include "btop_shared.hpp"
 #include "btop_tools.hpp"
 #include "btop_config.hpp"
+#ifdef __QNX__
+#include <unix.h> // setlinebuf
+#endif
 
 using std::cout;
 using std::floor;

@@ -94,7 +94,7 @@ namespace Shared {
 	//* Initialize platform specific needed variables and check for errors
 	void init();
 
-	extern long coreCount, page_size, clk_tck;
+	extern long coreCount, page_size, clkTck;
 
 #if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 	struct KvmDeleter {
@@ -201,7 +201,7 @@ namespace Gpu {
 namespace Cpu {
 	extern string box;
 	extern int x, y, width, height, min_width, min_height;
-	extern bool shown, redraw, got_sensors, cpu_temp_only, has_battery, supports_watts;
+	extern bool shown, redraw, got_sensors, cpu_temp_only, has_battery, supports_watts, has_loadavg;
 	extern string cpuName, cpuHz;
 	extern vector<string> available_fields;
 	extern vector<string> available_sensors;

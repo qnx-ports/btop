@@ -906,9 +906,14 @@ namespace Cpu {
 			string load_avg_pre = "Load avg:";
 			string load_avg;
 
-			for (const auto& val : cpu.load_avg) {
-				load_avg += fmt::format(" {:.2f}", val);
+			if (has_loadavg) {
+				for (const auto& val : cpu.load_avg) {
+					load_avg += fmt::format(" {:.2f}", val);
+				}
+			}else {
+				load_avg += " Unavailable";
 			}
+
 
 			int len = load_avg_pre.size() + load_avg.size();
 			out += Mv::to(b_y + cy, b_x + 1) + string(max(b_width - len - 2, 0), ' ') + Theme::c("main_fg") + Fx::b + load_avg_pre + Fx::ub + load_avg;

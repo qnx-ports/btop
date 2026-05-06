@@ -86,7 +86,7 @@ namespace Cpu {
 	vector<string> available_fields = {"total"};
 	vector<string> available_sensors = {"Auto"};
 	cpu_info current_cpu;
-	bool got_sensors = false, cpu_temp_only = false, supports_watts = false;
+	bool got_sensors = false, cpu_temp_only = false, supports_watts = false, has_loadavg = true;
 
 	//* Populate found_sensors map
 	bool get_sensors();
