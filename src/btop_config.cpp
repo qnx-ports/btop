@@ -292,7 +292,12 @@ namespace Config {
 		{"proc_cpu_graphs", true},
 		{"proc_info_smaps", false},
 		{"proc_left", false},
+#ifndef __QNX__
 		{"proc_filter_kernel", false},
+#else
+		// QNX kernel proc takes up all the remaining CPU time, so the usage % is always a massive number
+		{"proc_filter_kernel", true},
+#endif
 		{"cpu_invert_lower", true},
 		{"cpu_single_graph", false},
 		{"cpu_bottom", false},
