@@ -1,4 +1,5 @@
 /* Copyright 2021 Aristocratos (jakob@qvantnet.com)
+   Copyright (c) 2026, BlackBerry Limited. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -341,7 +342,7 @@ namespace Mem {
 
 		if (totalRam > 0) {
 			for (const auto& name : mem_names) {
-				mem.percent.at(name).push_back(round((double)mem.stats.at(name) * 100 / totalRam));
+				mem.percent.at(name).push_back(round(((double)mem.stats.at(name) * 100) / totalRam));
 				while (cmp_greater(mem.percent.at(name).size(), width * 2)) mem.percent.at(name).pop_front();
 			}
 		}
@@ -400,7 +401,7 @@ namespace Mem {
 							disk.total = (int64_t)vfs.f_blocks * (int64_t)vfs.f_frsize;
 							disk.free = (int64_t)vfs.f_bfree * (int64_t)vfs.f_frsize;
 							disk.used = disk.total - disk.free;
-							disk.used_percent = (int)round((double)disk.used * 100.0 / disk.total);
+							disk.used_percent = (int)round(((double)disk.used * 100.0) / disk.total);
 							disk.free_percent = 100 - disk.used_percent;
 						}
 					}
@@ -928,7 +929,7 @@ namespace Proc {
 				}
 
 				new_proc.cpu_s = info.start_time;
-				new_proc.cpu_p = clamp(100.0 * new_proc_time_ns / collect_interval * cmult, 0.0, 100.0 * Shared::coreCount);
+				new_proc.cpu_p = clamp(((100.0 * new_proc_time_ns) / collect_interval) * cmult, 0.0, 100.0 * Shared::coreCount);
 				new_proc.cpu_c = (double)(cpu_t * Shared::clkTck / 1e6) / max(1.0, (double)time_now_ns - new_proc.cpu_s);
 				new_proc.cpu_t = cpu_t;
 
@@ -1075,7 +1076,10 @@ namespace Proc {
 
 namespace Tools {
     double system_uptime() {
-        time_t bt = (time_t)SYSPAGE_ENTRY(qtime)->boot_time;
-        return (double)(time(nullptr) - bt);
+		struct timespec tp;
+		if (clock_gettime(CLOCK_MONOTONIC, &tp) == -1)
+			return -1;
+
+		return (double)tp.tv_sec + (double)tp.tv_nsec / 1e9;
     }
 } // namespace Tools
